@@ -1,19 +1,43 @@
+#!/usr/bin/env python3
+"""
+Distributed 4-GPU inference script for the SENORITA Control CogVideoX pipeline.
+
+This script loads editing tasks from a JSON file and runs them in parallel across
+multiple GPUs using torch.distributed. The saved outputs follow the same naming
+convention as `VideoX-Fun/examples/wan2.1/predict_v2v_json_new.py`, producing:
+
+- `<base>_input.mp4`   : the conditioning video used by the pipeline
+- `<base>_gen.mp4`     : the generated result video
+- `<base>_compare.mp4` : side-by-side comparison of input | generated frames
+- `<base>_gen_info.txt`: text file storing the prompt that was used
+
+Launch with:
+    torchrun --nproc_per_node=4 parallel_control_cogvideox_pipeline.py \
+        --tasks_json path/to/tasks.json \
+        --output_dir path/to/results \
+        --model_root path/to/cogvideox-5b-i2v \
+        --control_checkpoint path/to/ff_controlnet_half.pth
+"""
+
 import argparse
 import json
 import math
 import os
+import sys
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-import imageio
+import cv2
+import decord
 import numpy as np
 import torch
 import torch.distributed as dist
+from PIL import Image
 from diffusers import AutoencoderKLCogVideoX
 from diffusers.schedulers import CogVideoXDDIMScheduler
 from diffusers.utils import export_to_video
+from einops import rearrange
 from omegaconf import OmegaConf
-from PIL import Image
 from transformers import T5EncoderModel, T5Tokenizer
 
 from control_cogvideox.cogvideox_transformer_3d import CogVideoXTransformer3DModel
@@ -21,94 +45,79 @@ from control_cogvideox.controlnet_cogvideox_transformer_3d import ControlCogVide
 from pipeline_cogvideox_controlnet_5b_i2v_instruction2 import ControlCogVideoXPipeline
 
 
+DEFAULT_NEGATIVE_PROMPT = (
+    "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, "
+    "overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly "
+    "drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy "
+    "background, three legs, many people in the background, walking backwards"
+)
+
+
 @dataclass
 class TaskItem:
-    stem: str
-    source_video_path: str
-    prompt: str
-    negative_prompt: str
-    guidance_scale: float
-
-
-def _align_to_multiple(value: int, base: int = 8) -> int:
-    if value % base == 0:
-        return value
-    return max(base, math.ceil(value / base) * base)
+    base_name: str
+    data: Dict[str, Any]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Distributed inference for ControlCogVideoXPipeline with first-frame conditioning."
+        description="Run SENORITA Control CogVideoX pipeline with 4-GPU distributed inference."
     )
-    parser.add_argument("--tasks_json", type=str, required=True, help="Path to JSON file describing tasks.")
+    parser.add_argument("--tasks_json", type=str, required=True, help="Path to tasks JSON file.")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to store generated results.")
-    parser.add_argument(
-        "--model_root",
-        type=str,
-        default="./cogvideox-5b-i2v",
-        help="Root directory containing CogVideoX 5B I2V model weights.",
-    )
+    parser.add_argument("--model_root", type=str, default="./cogvideox-5b-i2v", help="CogVideoX model root folder.")
     parser.add_argument(
         "--control_checkpoint",
         type=str,
         default="./senorita-2m/models_half/ff_controlnet_half.pth",
-        help="Path to SENORITA controlnet checkpoint.",
+        help="Checkpoint containing transformer and controlnet weights.",
     )
-    parser.add_argument("--num_frames", type=int, default=33, help="Number of frames to generate (<= 49).")
-    parser.add_argument(
-        "--height",
-        type=int,
-        default=None,
-        help="Frame height override. Defaults to aligned input height if not set.",
-    )
-    parser.add_argument(
-        "--width",
-        type=int,
-        default=None,
-        help="Frame width override. Defaults to aligned input width if not set.",
-    )
-    parser.add_argument("--steps", type=int, default=30, help="Number of diffusion steps.")
-    parser.add_argument("--guidance_scale", type=float, default=4.0, help="Classifier-free guidance scale.")
-    parser.add_argument("--fps", type=int, default=8, help="FPS for exported videos.")
     parser.add_argument("--seed", type=int, default=0, help="Base random seed.")
+    parser.add_argument("--num_frames", type=int, default=33, help="Total frames to generate per sample.")
+    parser.add_argument("--source_frames", type=int, default=33, help="Frames taken from source video per pass.")
+    parser.add_argument("--height", type=int, default=448, help="Frame height used during generation.")
+    parser.add_argument("--width", type=int, default=768, help="Frame width used during generation.")
+    parser.add_argument("--steps", type=int, default=30, help="Number of inference steps per generation pass.")
+    parser.add_argument("--guidance_scale", type=float, default=4.0, help="Classifier-free guidance scale.")
+    parser.add_argument("--fps", type=int, default=8, help="Frames per second for exported videos.")
     parser.add_argument(
-        "--default_prompt",
+        "--negative_prompt",
         type=str,
-        default="",
-        help="Fallback positive prompt when task JSON does not provide one.",
-    )
-    parser.add_argument(
-        "--default_negative_prompt",
-        type=str,
-        default="",
-        help="Fallback negative prompt when task JSON does not provide one.",
+        default=DEFAULT_NEGATIVE_PROMPT,
+        help="Default negative prompt if a task does not provide one.",
     )
     parser.add_argument(
         "--control_num_layers",
         type=int,
         default=6,
-        help="Number of control transformer layers to instantiate.",
+        help="Number of control layers to enable in the control transformer.",
     )
     parser.add_argument(
         "--skip_existing",
         action="store_true",
-        default=False,
-        help="Skip items that already have generated videos in output directory.",
+        help="Skip samples whose `<base>_gen.mp4` already exists in the output directory.",
+    )
+    parser.add_argument(
+        "--edited_videos_dir",
+        type=str,
+        default=None,
+        help="Directory containing generated videos named as `gen_<item_id>.mp4`; "
+        "the script will use their first frames as reference images when available.",
     )
     return parser.parse_args()
 
 
-def init_distributed() -> Tuple[int, int]:
-    if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    torch.cuda.set_device(rank)
-    return rank, world_size
+def resolve_path(path: Optional[str], base_dir: str) -> Optional[str]:
+    if path is None:
+        return None
+    expanded = os.path.expandvars(os.path.expanduser(path))
+    if os.path.isabs(expanded):
+        return expanded
+    return os.path.abspath(os.path.join(base_dir, expanded))
 
 
-def unwarp_model(state_dict: Dict[str, Any]) -> Dict[str, Any]:
-    new_state_dict = {}
+def unwarp_model(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    new_state_dict: Dict[str, torch.Tensor] = {}
     for key, value in state_dict.items():
         if key.startswith("module."):
             new_state_dict[key.split("module.", 1)[1]] = value
@@ -117,388 +126,525 @@ def unwarp_model(state_dict: Dict[str, Any]) -> Dict[str, Any]:
     return new_state_dict
 
 
-def load_pipeline(args: argparse.Namespace, device: torch.device, rank: int) -> ControlCogVideoXPipeline:
-    i2v_key = "i2v"
-    scheduler_cfg_path = os.path.join(args.model_root, f"cogvideox-5b-{i2v_key}", "scheduler", "scheduler_config.json")
-    if not os.path.exists(scheduler_cfg_path):
-        scheduler_cfg_path = os.path.join(args.model_root, "scheduler", "scheduler_config.json")
+def init_pipeline(
+    model_root: str,
+    control_checkpoint: str,
+    device: torch.device,
+    dtype: torch.dtype = torch.float16,
+    control_num_layers: int = 6,
+) -> ControlCogVideoXPipeline:
+    key = "i2v"
+    scheduler_config = OmegaConf.to_container(
+        OmegaConf.load(os.path.join(model_root, "scheduler", "scheduler_config.json"))
+    )
+    noise_scheduler = CogVideoXDDIMScheduler(**scheduler_config)
 
-    scheduler_config = OmegaConf.to_container(OmegaConf.load(scheduler_cfg_path))
-    scheduler = CogVideoXDDIMScheduler(**scheduler_config)
+    text_encoder = T5EncoderModel.from_pretrained(
+        model_root, subfolder="text_encoder", torch_dtype=dtype
+    )
+    vae = AutoencoderKLCogVideoX.from_pretrained(model_root, subfolder="vae", torch_dtype=dtype)
+    tokenizer = T5Tokenizer.from_pretrained(os.path.join(model_root, "tokenizer"), torch_dtype=dtype)
 
-    model_root_candidates = [
-        os.path.join(args.model_root, f"cogvideox-5b-{i2v_key}"),
-        args.model_root,
-    ]
-
-    base_root = None
-    for candidate in model_root_candidates:
-        if os.path.isdir(candidate):
-            base_root = candidate
-            break
-    if base_root is None:
-        raise FileNotFoundError(f"Could not locate CogVideoX model root under '{args.model_root}'.")
-
-    text_encoder = T5EncoderModel.from_pretrained(base_root, subfolder="text_encoder", torch_dtype=torch.float16)
-    vae = AutoencoderKLCogVideoX.from_pretrained(base_root, subfolder="vae", torch_dtype=torch.float16)
-    tokenizer = T5Tokenizer.from_pretrained(os.path.join(base_root, "tokenizer"))
-
-    transformer_config_path = os.path.join(base_root, "transformer", "config.json")
-    transformer_config = OmegaConf.to_container(OmegaConf.load(transformer_config_path))
-    transformer_config["in_channels"] = 32
+    transformer_config = OmegaConf.to_container(OmegaConf.load(os.path.join(model_root, "transformer", "config.json")))
+    transformer_config["in_channels"] = 32 if key == "i2v" else 16
     transformer = CogVideoXTransformer3DModel(**transformer_config)
 
-    control_config = OmegaConf.to_container(OmegaConf.load(transformer_config_path))
-    control_config["in_channels"] = 32
-    control_config["num_layers"] = args.control_num_layers
+    control_config = OmegaConf.to_container(OmegaConf.load(os.path.join(model_root, "transformer", "config.json")))
+    control_config["in_channels"] = 32 if key == "i2v" else 16
+    control_config["num_layers"] = control_num_layers
     control_config["control_in_channels"] = 16
     controlnet_transformer = ControlCogVideoXTransformer3DModel(**control_config)
 
-    if not os.path.exists(args.control_checkpoint):
-        raise FileNotFoundError(f"Control checkpoint not found at '{args.control_checkpoint}'.")
-    all_state_dicts = torch.load(args.control_checkpoint, map_location="cpu")
-    transformer.load_state_dict(unwarp_model(all_state_dicts["transformer_state_dict"]), strict=True)
-    controlnet_transformer.load_state_dict(unwarp_model(all_state_dicts["controlnet_transformer_state_dict"]), strict=True)
+    try:
+        checkpoint = torch.load(control_checkpoint, map_location="cpu", weights_only=True)
+    except TypeError:
+        checkpoint = torch.load(control_checkpoint, map_location="cpu")
+    transformer_state_dict = unwarp_model(checkpoint["transformer_state_dict"])
+    controlnet_state_dict = unwarp_model(checkpoint["controlnet_transformer_state_dict"])
+    transformer.load_state_dict(transformer_state_dict, strict=True)
+    controlnet_transformer.load_state_dict(controlnet_state_dict, strict=True)
 
-    text_encoder = text_encoder.to(device)
-    vae = vae.to(device)
-    transformer = transformer.to(device).half()
-    controlnet_transformer = controlnet_transformer.to(device).half()
+    transformer = transformer.to(dtype).eval()
+    controlnet_transformer = controlnet_transformer.to(dtype).eval()
+    vae = vae.eval()
+    text_encoder = text_encoder.eval()
 
     pipe = ControlCogVideoXPipeline(
         tokenizer=tokenizer,
-        text_encoder=text_encoder.half(),
-        vae=vae.half(),
+        text_encoder=text_encoder,
+        vae=vae,
         transformer=transformer,
-        scheduler=scheduler,
+        noise_scheduler=noise_scheduler,
         controlnet_transformer=controlnet_transformer,
     )
-
     pipe.vae.enable_slicing()
     pipe.vae.enable_tiling()
-    pipe.set_progress_bar_config(disable=rank != 0)
-    pipe.to(device)
-    pipe._execution_device = device  # noqa: SLF001
-
-    pipe.vae.eval()
-    pipe.text_encoder.eval()
-    pipe.transformer.eval()
-    pipe.controlnet_transformer.eval()
+    pipe.enable_model_cpu_offload(device=device)
 
     return pipe
 
 
-def derive_ground_instruction(edit_instruction_text: str) -> str:
-    s = (edit_instruction_text or "").strip()
-    if s.endswith("."):
-        s = s[:-1]
-    lower = s.lower()
-    for prefix in ["remove ", "delete ", "erase ", "eliminate ", "add ", "make ", "ground "]:
-        if lower.startswith(prefix):
-            s = s[len(prefix) :]
-            break
-    return s
-
-
-def resolve_prompts(item: Dict[str, Any], args: argparse.Namespace) -> Tuple[str, str, float]:
-    prompt = (
-        item.get("prompt")
-        or item.get("positive_prompt")
-        or item.get("qwen_vl_72b_refined_instruction")
-        or item.get("edit_instruction")
-        or item.get("text")
-        or args.default_prompt
-    )
-    negative = item.get("negative_prompt", args.default_negative_prompt)
-
-    if args.videoedit_reasoning:
-        ground = derive_ground_instruction(prompt)
-        prompt = (
-            "A video sequence showing three parts: first the original scene, "
-            f"then grounded {ground}, and finally the same scene but {prompt}"
-        )
-    else:
-        prompt = (
-            "A video sequence showing two parts: the first half shows the original scene, "
-            f"and the second half shows the same scene but {prompt}"
-        )
-
-    guidance_scale = float(item.get("guidance_scale", args.guidance_scale))
-
-    return prompt, negative, guidance_scale
-
-
-def infer_output_stem(item: Dict[str, Any]) -> str:
-    if "output_name" in item and item["output_name"]:
-        return os.path.splitext(os.path.basename(item["output_name"]))[0]
-    if "task_type" in item and "sample_id" in item:
-        return f"{item['task_type']}_{item['sample_id']}"
-    if "id" in item:
-        return str(item["id"])
-    if "source_video_path" in item and item["source_video_path"]:
-        return os.path.splitext(os.path.basename(item["source_video_path"]))[0]
-    raise ValueError("Unable to infer output stem from task item.")
-
-
-def build_tasks(args: argparse.Namespace) -> List[TaskItem]:
-    with open(args.tasks_json, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    if isinstance(data, dict):
-        items_iter = data.items()
-    else:
-        items_iter = enumerate(data)
-
-    tasks: List[TaskItem] = []
-    for _, raw_item in items_iter:
-        if "source_video_path" not in raw_item:
-            raise KeyError("Each task must include 'source_video_path'.")
-
-        prompt, negative, guidance = resolve_prompts(raw_item, args)
-        stem = infer_output_stem(raw_item)
-        tasks.append(
-            TaskItem(
-                stem=stem,
-                source_video_path=raw_item["source_video_path"],
-                prompt=prompt,
-                negative_prompt=negative,
-                guidance_scale=guidance,
-            )
-        )
-    return tasks
-
-
-def split_work(tasks: List[TaskItem], rank: int, world_size: int) -> List[TaskItem]:
-    if world_size <= 1:
-        return tasks
-    return tasks[rank::world_size]
-
-
 def load_video_frames(
     video_path: str,
-    num_frames: int,
-    target_height: Optional[int],
-    target_width: Optional[int],
-) -> Tuple[np.ndarray, int, int]:
-    reader = imageio.get_reader(video_path)
-    raw_frames: List[np.ndarray] = []
-    for idx in range(num_frames):
-        try:
-            frame = reader.get_data(idx)
-        except IndexError:
-            break
-        raw_frames.append(np.asarray(frame, dtype=np.uint8))
-    reader.close()
+    target_frames: int,
+    width: int,
+    height: int,
+) -> Tuple[torch.Tensor, List[Image.Image], List[Image.Image], Tuple[int, int]]:
+    vr = decord.VideoReader(video_path)
+    total_frames = len(vr)
+    if total_frames == 0:
+        raise ValueError(f"No frames found in video: {video_path}")
 
-    if not raw_frames:
-        raise RuntimeError(f"Failed to read any frames from '{video_path}'.")
+    frame_indices = list(range(min(total_frames, target_frames)))
+    frames_np = vr.get_batch(frame_indices).asnumpy()
+    original_height, original_width = frames_np.shape[1], frames_np.shape[2]
 
-    original_height, original_width = raw_frames[0].shape[0], raw_frames[0].shape[1]
+    frames_list = [frames_np[i] for i in range(frames_np.shape[0])]
+    while len(frames_list) < target_frames:
+        frames_list.append(frames_list[-1].copy())
 
-    final_height = _align_to_multiple(target_height if target_height is not None else original_height)
-    final_width = _align_to_multiple(target_width if target_width is not None else original_width)
+    resized_frames = [cv2.resize(frame, (width, height), interpolation=cv2.INTER_CUBIC) for frame in frames_list]
+    resized_np = np.stack(resized_frames, axis=0).astype(np.uint8)
 
-    if target_height is not None and final_height != target_height:
-        print(f"[WARN] Requested height {target_height} adjusted to {final_height} (must be divisible by 8).")
-    if target_width is not None and final_width != target_width:
-        print(f"[WARN] Requested width {target_width} adjusted to {final_width} (must be divisible by 8).")
+    source_tensor = torch.from_numpy(resized_np).contiguous().unsqueeze(0)
 
-    if final_height != original_height or final_width != original_width:
-        print(
-            f"Resizing frames from {original_width}x{original_height} to {final_width}x{final_height} "
-            f"for '{os.path.basename(video_path)}'."
-        )
-
-    frames: List[np.ndarray] = []
-    for frame in raw_frames:
-        pil_frame = Image.fromarray(frame, mode="RGB")
-        if pil_frame.size != (final_width, final_height):
-            pil_frame = pil_frame.resize((final_width, final_height), Image.BICUBIC)
-        frames.append(np.array(pil_frame, dtype=np.uint8))
-
-    while len(frames) < num_frames:
-        frames.append(frames[-1].copy())
-
-    frames_np = np.stack(frames, axis=0)
-    return frames_np, final_height, final_width
+    original_pil = [Image.fromarray(frame) for frame in frames_list]
+    resized_pil = [Image.fromarray(frame) for frame in resized_frames]
+    return source_tensor, original_pil, resized_pil, (original_height, original_width)
 
 
-def prepare_conditions(
+def load_first_frame_tensor(
+    video_path: str,
+    width: int,
+    height: int,
+) -> Optional[torch.Tensor]:
+    if video_path is None or not os.path.exists(video_path):
+        return None
+    try:
+        reader = decord.VideoReader(video_path)
+        if len(reader) == 0:
+            return None
+        frame = reader[0].asnumpy()
+    except Exception as exc:
+        print(f"Warning: unable to read first frame from {video_path}: {exc}")
+        return None
+
+    try:
+        image = Image.fromarray(frame)
+    except Exception as exc:
+        print(f"Warning: unable to convert first frame from {video_path} to image: {exc}")
+        return None
+
+    resized = image.resize((width, height), Image.BICUBIC)
+    arr = np.array(resized, dtype=np.uint8)
+    return torch.from_numpy(arr).unsqueeze(0).unsqueeze(0).contiguous()
+
+
+def prepare_reference_tensor(
+    image_path: Optional[str],
+    fallback_frame: Optional[Image.Image],
+    width: int,
+    height: int,
+    first_frame_video: Optional[str] = None,
+) -> Optional[torch.Tensor]:
+    if image_path and os.path.exists(image_path):
+        image = cv2.imread(image_path)
+        if image is None:
+            raise FileNotFoundError(f"Failed to read reference image: {image_path}")
+        image = cv2.cvtColor(cv2.resize(image, (width, height), interpolation=cv2.INTER_CUBIC), cv2.COLOR_BGR2RGB)
+    elif first_frame_video:
+        tensor = load_first_frame_tensor(first_frame_video, width, height)
+        if tensor is not None:
+            return tensor
+        if fallback_frame is None:
+            return None
+        image = np.array(fallback_frame.resize((width, height), Image.BICUBIC))
+    else:
+        if fallback_frame is None:
+            return None
+        image = np.array(fallback_frame.resize((width, height), Image.BICUBIC))
+
+    tensor = torch.from_numpy(image.astype(np.uint8)).unsqueeze(0).unsqueeze(0).contiguous()
+    return tensor
+
+
+def pil_to_tensor_batch(frame: Image.Image, width: int, height: int) -> torch.Tensor:
+    resized = frame.resize((width, height), Image.BICUBIC)
+    arr = np.array(resized).astype(np.uint8)
+    return torch.from_numpy(arr).unsqueeze(0).unsqueeze(0).contiguous()
+
+
+def extend_frames(frames: List[Image.Image], target_length: int) -> List[Image.Image]:
+    if not frames:
+        return frames
+    if len(frames) >= target_length:
+        return frames[:target_length]
+    extension = [frames[-1].copy() for _ in range(target_length - len(frames))]
+    return frames + extension
+
+
+def resize_to_aspect(frames: Iterable[Image.Image], original_size: Tuple[int, int], target_height: int) -> List[Image.Image]:
+    original_height, original_width = original_size
+    if original_height <= 0 or original_width <= 0:
+        return list(frames)
+    target_width = int(round(original_width / original_height * target_height))
+    resized = [frame.resize((target_width, target_height), Image.BICUBIC) for frame in frames]
+    return resized
+
+
+def run_single_pass(
     pipe: ControlCogVideoXPipeline,
-    frames_np: np.ndarray,
+    source_images: torch.Tensor,
+    target_images: Optional[torch.Tensor],
+    prompt: str,
+    negative_prompt: str,
+    height: int,
+    width: int,
+    frames_per_pass: int,
+    steps: int,
+    guidance_scale: float,
+    generator: torch.Generator,
     device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    video = torch.from_numpy(frames_np).to(device=device, dtype=torch.float32)
-    video = video.unsqueeze(0)  # [1, F, H, W, C]
+) -> List[Image.Image]:
+    pipe.vae.to(device)
+    pipe.transformer.to(device)
+    pipe.controlnet_transformer.to(device)
 
-    source_pixel_values = video / 127.5 - 1.0
-    source_pixel_values = source_pixel_values.permute(0, 4, 1, 2, 3).contiguous()
+    source_pixel_values = source_images.to(torch.float32) / 127.5 - 1.0
+    source_pixel_values = source_pixel_values.to(dtype=torch.float16, device=device)
 
-    with torch.no_grad():
-        source_latents = pipe.vae.encode(source_pixel_values.to(dtype=torch.float16)).latent_dist.sample()
-        source_latents = source_latents * pipe.vae.config.scaling_factor
-    source_latents = source_latents.permute(0, 2, 1, 3, 4).contiguous()
-
-    first_frame = video[:, :1]
-    target_pixel_values = first_frame / 127.5 - 1.0
-    target_pixel_values = target_pixel_values.permute(0, 4, 1, 2, 3).contiguous()
+    if target_images is not None:
+        target_pixel_values = target_images.to(torch.float32) / 127.5 - 1.0
+        target_pixel_values = target_pixel_values.to(dtype=torch.float16, device=device)
+    else:
+        target_pixel_values = None
 
     with torch.no_grad():
-        image_latents = pipe.vae.encode(target_pixel_values.to(dtype=torch.float16)).latent_dist.sample()
-        image_latents = image_latents * pipe.vae.config.scaling_factor
-    image_latents = image_latents.permute(0, 2, 1, 3, 4).contiguous()
+        source_latents = pipe.vae.encode(rearrange(source_pixel_values, "b f h w c -> b c f h w")).latent_dist.sample()
+        source_latents = source_latents.to(torch.float16) * pipe.vae.config.scaling_factor
+        source_latents = rearrange(source_latents, "b c f h w -> b f c h w")
 
-    if image_latents.shape[1] < source_latents.shape[1]:
-        pad = torch.zeros(
-            image_latents.shape[0],
-            source_latents.shape[1] - image_latents.shape[1],
-            image_latents.shape[2],
-            image_latents.shape[3],
-            image_latents.shape[4],
-            device=image_latents.device,
-            dtype=image_latents.dtype,
+        if target_pixel_values is not None:
+            target_latents = pipe.vae.encode(rearrange(target_pixel_values, "b f h w c -> b c f h w")).latent_dist.sample()
+            target_latents = target_latents.to(torch.float16) * pipe.vae.config.scaling_factor
+            target_latents = rearrange(target_latents, "b c f h w -> b f c h w")
+            target_latents = torch.cat([target_latents, torch.zeros_like(source_latents)[:, 1:]], dim=1)
+        else:
+            target_latents = None
+
+        output = pipe(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            video_condition=source_latents,
+            video_condition2=target_latents,
+            height=height,
+            width=width,
+            num_frames=frames_per_pass,
+            num_inference_steps=steps,
+            interval=6,
+            guidance_scale=guidance_scale,
+            generator=generator,
+        ).frames[0]
+
+    return output
+
+
+def run_sequential_generation(
+    pipe: ControlCogVideoXPipeline,
+    source_images: torch.Tensor,
+    initial_target: Optional[torch.Tensor],
+    prompt: str,
+    negative_prompt: str,
+    height: int,
+    width: int,
+    total_frames: int,
+    frames_per_pass: int,
+    steps: int,
+    guidance_scale: float,
+    base_seed: int,
+    device: torch.device,
+) -> List[Image.Image]:
+    results: List[Image.Image] = []
+    target_tensor = initial_target
+    passes = max(1, math.ceil(total_frames / frames_per_pass))
+
+    for pass_idx in range(passes):
+        remaining = total_frames - len(results)
+        if remaining <= 0:
+            break
+
+        generator = torch.Generator(device=device).manual_seed(base_seed + pass_idx)
+        frames = run_single_pass(
+            pipe=pipe,
+            source_images=source_images,
+            target_images=target_tensor,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=height,
+            width=width,
+            frames_per_pass=frames_per_pass,
+            steps=steps,
+            guidance_scale=guidance_scale,
+            generator=generator,
+            device=device,
         )
-        image_latents = torch.cat([image_latents, pad], dim=1)
-    elif image_latents.shape[1] > source_latents.shape[1]:
-        image_latents = image_latents[:, : source_latents.shape[1]]
 
-    return source_latents.to(dtype=torch.float16), image_latents.to(dtype=torch.float16)
+        frames = frames[:remaining]
+        results.extend(frames)
 
+        if results and pass_idx + 1 < passes:
+            target_tensor = pil_to_tensor_batch(results[-1], width, height)
 
-def save_input_video(frames_np: np.ndarray, file_path: str, fps: int) -> None:
-    os.makedirs(os.path.dirname(file_path), exist_ok=True)
-    pil_frames = [Image.fromarray(frame.astype(np.uint8)) for frame in frames_np]
-    export_to_video(pil_frames, file_path, fps=fps)
-    print(f"Saved input video → {file_path}")
+    return results[:total_frames]
 
 
-def save_generated_video(frames: List[Image.Image], file_path: str, fps: int) -> None:
-    os.makedirs(os.path.dirname(file_path), exist_ok=True)
-    export_to_video(frames, file_path, fps=fps)
-    print(f"Saved generated video → {file_path}")
+def save_video(frames: List[Image.Image], path: str, fps: int) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    export_to_video(frames, path, fps=fps)
 
 
 def save_side_by_side(
-    source_frames_np: np.ndarray,
-    generated_frames: List[Image.Image],
-    file_path: str,
+    input_frames: List[Image.Image],
+    output_frames: List[Image.Image],
+    path: str,
     fps: int,
 ) -> None:
-    os.makedirs(os.path.dirname(file_path), exist_ok=True)
-    length = min(len(source_frames_np), len(generated_frames))
-    side_by_side_frames: List[Image.Image] = []
-    for idx in range(length):
-        src = Image.fromarray(source_frames_np[idx].astype(np.uint8)).convert("RGB")
-        gen = generated_frames[idx]
-        if gen.size != src.size:
-            gen = gen.resize(src.size, Image.BICUBIC)
-        combined = Image.new("RGB", (src.width + gen.width, src.height))
-        combined.paste(src, (0, 0))
-        combined.paste(gen, (src.width, 0))
-        side_by_side_frames.append(combined)
-    export_to_video(side_by_side_frames, file_path, fps=fps)
-    print(f"Saved side-by-side video → {file_path}")
+    count = min(len(input_frames), len(output_frames))
+    combined: List[Image.Image] = []
+    for idx in range(count):
+        left = input_frames[idx]
+        right = output_frames[idx]
+        if left.size[1] != right.size[1]:
+            right = right.resize((int(right.size[0] * left.size[1] / right.size[1]), left.size[1]), Image.BICUBIC)
+        canvas = Image.new("RGB", (left.width + right.width, left.height))
+        canvas.paste(left, (0, 0))
+        canvas.paste(right, (left.width, 0))
+        combined.append(canvas)
+    save_video(combined, path, fps)
 
 
-def run_task(
-    pipe: ControlCogVideoXPipeline,
-    task: TaskItem,
-    args: argparse.Namespace,
-    device: torch.device,
-    generator: torch.Generator,
-) -> None:
-    frames_np, video_height, video_width = load_video_frames(
-        task.source_video_path, args.num_frames, args.height, args.width
-    )
-    source_latents, image_latents = prepare_conditions(pipe, frames_np, device)
-
-    output = pipe(
-        prompt=task.prompt,
-        negative_prompt=task.negative_prompt,
-        video_condition=source_latents,
-        video_condition2=image_latents,
-        height=video_height,
-        width=video_width,
-        num_frames=args.num_frames,
-        num_inference_steps=args.steps,
-        guidance_scale=task.guidance_scale,
-        generator=generator,
-        output_type="pil",
-        return_dict=True,
-    )
-    generated_frames = output.frames[0]
-
-    base = os.path.join(args.output_dir, task.stem)
-    input_path = f"{base}_input.mp4"
-    gen_path = f"{base}_gen.mp4"
-    compare_path = f"{base}_compare.mp4"
-    info_path = f"{base}_prompt.txt"
-
-    save_input_video(frames_np, input_path, args.fps)
-    save_generated_video(generated_frames, gen_path, args.fps)
-    save_side_by_side(frames_np, generated_frames, compare_path, args.fps)
-
-    with open(info_path, "w", encoding="utf-8") as f:
-        f.write(task.prompt)
-
-    print(f"[Done] Saved outputs for stem '{task.stem}'.")
+def derive_base_name(item: Dict[str, Any], index: int) -> str:
+    if "item_id" in item and item["item_id"]:
+        return str(item["item_id"])
+    if "output_basename" in item and item["output_basename"]:
+        return str(item["output_basename"])
+    if "task_type" in item and "sample_id" in item:
+        return f"{item['task_type']}_{item['sample_id']}"
+    if "file_name" in item:
+        return os.path.splitext(os.path.basename(str(item["file_name"])))[0]
+    if "source_video_path" in item:
+        return os.path.splitext(os.path.basename(str(item["source_video_path"])))[0]
+    if "id" in item:
+        return f"sample_{item['id']}"
+    return f"sample_{index:04d}"
 
 
-def filter_pending(tasks: List[TaskItem], args: argparse.Namespace) -> List[TaskItem]:
-    if not args.skip_existing:
-        return tasks
-    pending: List[TaskItem] = []
-    for task in tasks:
-        output_path = os.path.join(args.output_dir, f"{task.stem}_gen.mp4")
-        if not os.path.exists(output_path):
-            pending.append(task)
-    return pending
+def load_tasks(tasks_json: str) -> List[Dict[str, Any]]:
+    with open(tasks_json, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if isinstance(data, dict):
+        if "tasks" in data and isinstance(data["tasks"], list):
+            return data["tasks"]
+        return list(data.values())
+    if isinstance(data, list):
+        return data
+    raise ValueError(f"Unsupported JSON structure in {tasks_json}")
+
+
+def gather_items(tasks: List[Dict[str, Any]]) -> List[TaskItem]:
+    items: List[TaskItem] = []
+    for idx, task in enumerate(tasks):
+        base = derive_base_name(task, idx)
+        items.append(TaskItem(base_name=base, data=task))
+    return items
 
 
 def main() -> None:
     args = parse_args()
+    tasks_json_abs = os.path.abspath(args.tasks_json)
+    output_dir_abs = os.path.abspath(args.output_dir)
+    os.makedirs(output_dir_abs, exist_ok=True)
+    edited_videos_dir = os.path.abspath(args.edited_videos_dir) if args.edited_videos_dir else None
 
-    if args.num_frames > 49:
-        raise ValueError("num_frames must be <= 49 due to rotary embedding limitation.")
-
-    if not torch.cuda.is_available():
-        raise EnvironmentError("CUDA is required for parallel execution.")
-
-    rank, world_size = init_distributed()
+    dist.init_process_group(backend="nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
 
     if rank == 0:
-        os.makedirs(args.output_dir, exist_ok=True)
-        print(f"Starting distributed inference with {world_size} GPUs.")
+        print(f"Running distributed inference on {world_size} GPUs")
+        print(f"Tasks JSON: {tasks_json_abs}")
+        print(f"Output directory: {output_dir_abs}")
+        if edited_videos_dir:
+            print(f"Edited videos directory: {edited_videos_dir}")
 
-    pipe = load_pipeline(args, device, rank)
-    generator = torch.Generator(device=device).manual_seed(args.seed + rank)
+    tasks = load_tasks(tasks_json_abs)
+    items = gather_items(tasks)
 
-    all_tasks = build_tasks(args)
-    pending_tasks = filter_pending(all_tasks, args)
+    pending: List[TaskItem] = []
+    for item in items:
+        output_path = os.path.join(output_dir_abs, f"{item.base_name}_gen.mp4")
+        if args.skip_existing and os.path.exists(output_path):
+            continue
+        pending.append(item)
 
     if rank == 0:
-        print(
-            f"Total tasks: {len(all_tasks)}, pending: {len(pending_tasks)}, skipped: {len(all_tasks) - len(pending_tasks)}"
+        skipped = len(items) - len(pending)
+        print(f"Total tasks: {len(items)} | Existing skipped: {skipped} | Pending: {len(pending)}")
+
+    subset = pending[rank::world_size]
+    if rank == 0:
+        for r in range(world_size):
+            count = len(pending[r::world_size])
+            print(f"GPU {r} will process {count} item(s)")
+
+    if not subset:
+        if rank == 0:
+            print("No pending tasks. Exiting.")
+        dist.barrier()
+        dist.destroy_process_group()
+        return
+
+    pipeline = init_pipeline(
+        model_root=os.path.abspath(args.model_root),
+        control_checkpoint=os.path.abspath(args.control_checkpoint),
+        device=device,
+        dtype=torch.float16,
+        control_num_layers=args.control_num_layers,
+    )
+
+    base_dir = os.path.dirname(tasks_json_abs)
+
+    for local_index, item in enumerate(subset):
+        task = item.data
+        base_name = item.base_name
+        output_video_path = os.path.join(output_dir_abs, f"{base_name}_gen.mp4")
+        if args.skip_existing and os.path.exists(output_video_path):
+            if rank == 0:
+                print(f"[GPU {rank}] Skipping {base_name}, output already exists.")
+            continue
+
+        source_video_path = (
+            task.get("source_video_path")
+            or task.get("video_path")
+            or task.get("input_video")
+            or task.get("source_path")
         )
+        source_video_path = resolve_path(source_video_path, base_dir)
+        if source_video_path is None or not os.path.exists(source_video_path):
+            print(f"[GPU {rank}] Missing source video for {base_name}, skipping.")
+            continue
 
-    local_tasks = split_work(pending_tasks, rank, world_size)
-    print(f"[GPU {rank}] Assigned {len(local_tasks)} tasks.")
+        reference_image_path = (
+            task.get("reference_image_path")
+            or task.get("image_path")
+            or task.get("target_image_path")
+            or task.get("first_frame_path")
+        )
+        reference_image_path = resolve_path(reference_image_path, base_dir)
 
-    for task in local_tasks:
+        edited_video_path = None
+        if edited_videos_dir:
+            candidate = os.path.join(edited_videos_dir, f"gen_{base_name}.mp4")
+            if os.path.exists(candidate):
+                edited_video_path = candidate
+
+        prompt = (
+            task.get("positive_prompt")
+            or task.get("prompt")
+            or task.get("edit_instruction")
+            or task.get("text")
+            or ""
+        )
+        negative_prompt = task.get("negative_prompt", args.negative_prompt)
+        guidance_scale = float(task.get("guidance_scale", args.guidance_scale))
+        steps = int(task.get("num_inference_steps", args.steps))
+        total_frames = int(task.get("num_frames", args.num_frames))
+        frames_per_pass = int(task.get("source_frames", args.source_frames))
+        height = int(task.get("height", args.height))
+        width = int(task.get("width", args.width))
+        fps = int(task.get("fps", args.fps))
+        sample_seed = int(task.get("seed", args.seed + rank * 1000 + local_index))
+
+        print(f"[GPU {rank}] Processing {base_name} | prompt: {prompt[:80]}...")
+
         try:
-            print(f"[GPU {rank}] Processing {task.stem} ...")
-            run_task(pipe, task, args, device, generator)
-            torch.cuda.empty_cache()
-        except Exception as exc:  # noqa: BLE001
-            print(f"[GPU {rank}] Error while processing '{task.stem}': {exc}")
+            source_tensor, original_frames, resized_frames, original_size = load_video_frames(
+                source_video_path,
+                target_frames=frames_per_pass,
+                width=width,
+                height=height,
+            )
+        except Exception as exc:
+            print(f"[GPU {rank}] Failed to load video for {base_name}: {exc}")
+            continue
+
+        try:
+            reference_tensor = prepare_reference_tensor(
+                reference_image_path,
+                fallback_frame=original_frames[0] if original_frames else None,
+                width=width,
+                height=height,
+                first_frame_video=edited_video_path,
+            )
+        except Exception as exc:
+            print(f"[GPU {rank}] Failed to load reference image for {base_name}: {exc}")
+            continue
+
+        try:
+            generated_frames = run_sequential_generation(
+                pipe=pipeline,
+                source_images=source_tensor,
+                initial_target=reference_tensor,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                height=height,
+                width=width,
+                total_frames=total_frames,
+                frames_per_pass=frames_per_pass,
+                steps=steps,
+                guidance_scale=guidance_scale,
+                base_seed=sample_seed,
+                device=device,
+            )
+        except Exception as exc:
+            print(f"[GPU {rank}] Generation failed for {base_name}: {exc}")
+            continue
+
+        if not generated_frames:
+            print(f"[GPU {rank}] No frames generated for {base_name}, skipping save.")
+            continue
+
+        input_frames_for_save = extend_frames(resized_frames, len(generated_frames))
+
+        output_frames_resized = resize_to_aspect(generated_frames, original_size, target_height=height)
+        input_frames_resized = resize_to_aspect(input_frames_for_save, original_size, target_height=height)
+
+        input_path = os.path.join(output_dir_abs, f"{base_name}_input.mp4")
+        compare_path = os.path.join(output_dir_abs, f"{base_name}_compare.mp4")
+        info_path = os.path.join(output_dir_abs, f"{base_name}_gen_info.txt")
+
+        try:
+            save_video(input_frames_resized, input_path, fps)
+            save_video(output_frames_resized, output_video_path, fps)
+            save_side_by_side(input_frames_resized, output_frames_resized, compare_path, fps)
+            with open(info_path, "w", encoding="utf-8") as info_file:
+                info_file.write(prompt)
+        except Exception as exc:
+            print(f"[GPU {rank}] Saving results failed for {base_name}: {exc}")
+            continue
+
+        print(f"[GPU {rank}] Completed {base_name}")
 
     dist.barrier()
-    if rank == 0:
-        print("All tasks completed.")
     dist.destroy_process_group()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
+
 
