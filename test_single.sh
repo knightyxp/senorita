@@ -1,0 +1,17 @@
+python3 test_control_cogvideox_pipeline.py \
+    --source_video /path/to/video.mp4 \
+    --output_dir results/senorita_bench_test \
+    --model_root /path/to/cogvideox-5b-i2v \
+    --control_checkpoint /path/to/ff_controlnet_half.pth \
+    --prompt "描述想要的效果" \
+    --negative_prompt "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards" \
+    --num_frames 33 \
+    --height 448 \
+    --width 768 \
+    --steps 30 \
+    --guidance_scale 4.0 \
+    --fps 8 \
+    --seed 0 \
+    --control_num_layers 6 \
+    --save_input \
+    --save_compare
