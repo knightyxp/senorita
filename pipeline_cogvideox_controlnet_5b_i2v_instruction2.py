@@ -691,19 +691,19 @@ class ControlCogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 if video_condition2 is not None:
-                    print("latent_model_input", latent_model_input.shape, "video_condition_model_input2", video_condition_model_input2.shape)
+                    #print("latent_model_input", latent_model_input.shape, "video_condition_model_input2", video_condition_model_input2.shape)
                     latent_model_input2 = torch.cat([latent_model_input, video_condition_model_input2], dim=2)
                 else:
-                    print("latent_model_input", latent_model_input.shape)
+                    #print("latent_model_input", latent_model_input.shape)
                     latent_model_input2 = latent_model_input
 
-                print("video_condition_model_input1", video_condition_model_input1.shape)
-                print("latent_model_input2", latent_model_input2.shape)
+                #print("video_condition_model_input1", video_condition_model_input1.shape)
+                #print("latent_model_input2", latent_model_input2.shape)
 
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latent_model_input.shape[0])
 
-                print('image rotary emb is None:', image_rotary_emb is None)
+                #print('image rotary emb is None:', image_rotary_emb is None)
 
                 residual_hidden_states = self.controlnet_transformer(
                     hidden_states=latent_model_input2,# 32
@@ -728,7 +728,7 @@ class ControlCogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
                 )[0]
                 noise_pred = noise_pred.float()
 
-                print(noise_pred.shape)
+                #print(noise_pred.shape)
 
                 # perform guidance
                 if use_dynamic_cfg:
