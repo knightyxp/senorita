@@ -174,7 +174,7 @@ def init_pipeline(
         text_encoder=text_encoder,
         vae=vae,
         transformer=transformer,
-        noise_scheduler=noise_scheduler,
+        scheduler=noise_scheduler,
         controlnet_transformer=controlnet_transformer,
     )
     pipe.vae.enable_slicing()
