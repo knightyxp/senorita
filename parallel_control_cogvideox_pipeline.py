@@ -213,26 +213,29 @@ def load_video_frames(
     return source_tensor, original_pil, resized_pil, (original_height, original_width)
 
 
-def load_first_frame_tensor(
+def load_video_frame_tensor(
     video_path: str,
     width: int,
     height: int,
+    frame_index: int = 0,
 ) -> Optional[torch.Tensor]:
     if video_path is None or not os.path.exists(video_path):
         return None
     try:
         reader = decord.VideoReader(video_path)
-        if len(reader) == 0:
+        total = len(reader)
+        if total == 0:
             return None
-        frame = reader[0].asnumpy()
+        index = frame_index if frame_index < total else total - 1
+        frame = reader[index].asnumpy()
     except Exception as exc:
-        print(f"Warning: unable to read first frame from {video_path}: {exc}")
+        print(f"Warning: unable to read frame {frame_index} from {video_path}: {exc}")
         return None
 
     try:
         image = Image.fromarray(frame)
     except Exception as exc:
-        print(f"Warning: unable to convert first frame from {video_path} to image: {exc}")
+        print(f"Warning: unable to convert frame {frame_index} from {video_path} to image: {exc}")
         return None
 
     resized = image.resize((width, height), Image.BICUBIC)
@@ -253,7 +256,7 @@ def prepare_reference_tensor(
             raise FileNotFoundError(f"Failed to read reference image: {image_path}")
         image = cv2.cvtColor(cv2.resize(image, (width, height), interpolation=cv2.INTER_CUBIC), cv2.COLOR_BGR2RGB)
     elif first_frame_video:
-        tensor = load_first_frame_tensor(first_frame_video, width, height)
+        tensor = load_video_frame_tensor(first_frame_video, width, height, frame_index=1)
         if tensor is not None:
             return tensor
         if fallback_frame is None:
